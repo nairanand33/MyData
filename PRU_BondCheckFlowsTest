@@ -1,0 +1,258 @@
+/********************************************************************************/
+/* JIRA: CT-201323                                                              */
+/* Purpose: Test class for Bond_check_updates_flow and Review_Required flows   */
+/* Author: Anand Nair                                                      */
+/* Date: 25-11-2024                                                             */
+/* Description: Comprehensive test coverage for bond check record-triggered     */
+/*              flows that update parent case status to Review Required when    */
+/*              bond check result changes.               						*/
+/********************************************************************************/
+@isTest
+private class PRU_BondCheckFlowsTest {
+    
+    // Record Type IDs for Case
+    private static Id parentCaseRecordTypeId;
+    
+    private static Id onbSingleContributionRecordTypeId = Schema.SObjectType.Case.getRecordTypeInfosByDeveloperName()
+            .get('PRU_ONBSingleContribution').getRecordTypeId();
+    
+    private static Id onbAccountSetupRecordTypeId = Schema.SObjectType.Case.getRecordTypeInfosByDeveloperName()
+            .get('PRU_ONBAccountSetup').getRecordTypeId();
+    
+    private static final String REVIEW_REQUIRED_STATUS = 'Review Required';
+    
+    // Record Type IDs for Bond Check
+    private static Id originOfFundsRecordTypeId;
+    
+    // Test user with PRU_CRMUser permission set
+    private static User opsUser;
+    
+    /**
+     * @description Creates and inserts custom setting to enable bond check flow
+     */
+    public static void createCustomSetting(){
+        PRU_Process_Management__c customSetting = new PRU_Process_Management__c();
+        customSetting.PRU_BondCheck_Flow__c = true;
+        insert customSetting;
+    }
+    
+    /**
+     * @description Helper method to setup parent and child case for owner update tests
+     * @param childSubject Subject for the child case
+     * @param childRecordTypeId Record type ID for the child case
+     * @return Map containing parent case, child case, queue, and ops user
+     */
+    private static Map<String, Object> setupOwnerUpdateTestData(String childSubject, Id childRecordTypeId) {
+        createCustomSetting();
+        
+        Group oNBBusinessQueue = [SELECT Id FROM Group WHERE DeveloperName = 'PRU_ONBNewBusiness' LIMIT 1];
+        Case parentCase = createParentCase(oNBBusinessQueue.Id, 'Test Parent Case - Owner Update', REVIEW_REQUIRED_STATUS);
+        
+        Case childCase = createChildCase(parentCase.Id, childSubject, REVIEW_REQUIRED_STATUS, childRecordTypeId);
+        childCase.OwnerId = oNBBusinessQueue.Id;
+        update childCase;
+        
+        User opsUser1 = [SELECT Id FROM User WHERE FirstName = 'TestOPS' LIMIT 1];
+        
+        Map<String, Object> testData = new Map<String, Object>();
+        testData.put('parentCase', parentCase);
+        testData.put('childCase', childCase);
+        testData.put('queue', oNBBusinessQueue);
+        testData.put('opsUser', opsUser1);
+        
+        return testData;
+    }
+    
+    /**
+     * @description Helper method to execute the owner update flow and verify results
+     * @param parentCase Parent case to update
+     * @param opsUser OPS user to assign as new owner
+     * @param childSubject Subject of child case to verify
+     */
+    private static void executeOwnerUpdateFlowAndVerify(Case parentCase, User opsUser, String childSubject) {
+        Test.startTest();
+        parentCase.OwnerId = opsUser.Id;
+        update parentCase;
+        
+        // Manually invoke the flow since record-triggered flows don't execute in test context
+        Map<String, Object> flowInputs = new Map<String, Object>();
+        flowInputs.put('caseRecordVar', parentCase);
+        Flow.Interview.PRU_Update_the_child_case_owner_to_parent_case flowInstance = 
+            new Flow.Interview.PRU_Update_the_child_case_owner_to_parent_case(flowInputs);
+        flowInstance.start();
+        
+        Test.stopTest();
+        
+        // Verify child case owner was updated to match parent's new owner
+        Case childCase = [SELECT Id, OwnerId FROM Case WHERE Subject = :childSubject LIMIT 1];
+        System.assertEquals(opsUser.Id, childCase.OwnerId, 
+            'The child case should have the same owner as the parent.');
+    }
+    
+    public static Case createParentCase(Id opsUser,String subject,string status){
+        // Create parent case with Type = 'ONB New Business'
+        parentCaseRecordTypeId = Schema.SObjectType.Case.getRecordTypeInfosByDeveloperName()
+            .get('PRU_Parent').getRecordTypeId();
+        Case parentCase = new Case(
+                    RecordTypeId = parentCaseRecordTypeId,
+                    Type = 'ONB New Business',
+                    Status = status,
+                    Subject = subject,
+                    Origin = 'Digital Account',
+                    OwnerId = opsUser
+                );
+        insert parentCase;
+        return parentCase;
+    }
+    
+    public static Case createChildCase(Id parentCaseId,String subject,String status,Id childCaseRecordTypeId){
+        // Create child case linked to parent
+        
+        Case childCase = new Case(
+                    RecordTypeId = childCaseRecordTypeId,
+                    ParentId = parentCaseId,
+                    Type = 'ONB New Business',
+                    Status = status,
+                    Subject = subject
+        );
+        insert childCase;
+        return childCase;
+    }
+    
+    /**
+     * @description Setup method to create test data including custom settings,
+     *              record types, test user with permission set, and case hierarchy.
+     *              This runs once before all test methods in this class.
+     *              Note: User and permission set assignment are done in separate transaction
+     *              to avoid MIXED_DML_OPERATION error.
+     */
+    @TestSetup
+    static void setupTestData() {
+        
+        // Create test user and assign permission set in separate transaction to avoid MIXED_DML error
+        System.runAs(new User(Id = UserInfo.getUserId())) {
+            // Create test user with standard profile
+            Profile adminProfile = [SELECT Id FROM Profile WHERE Name = 'System Administrator' LIMIT 1];
+            opsUser = new User(
+                ProfileId = adminProfile.Id,
+                FirstName = 'TestOPS',
+                LastName = 'User',
+                Email = 'opsuser@testorg.com',
+                Username = 'opsuser' + System.currentTimeMillis() + '@testorg.com',
+                Alias = 'opsusr',
+                TimeZoneSidKey = 'America/New_York',
+                LocaleSidKey = 'en_US',
+                EmailEncodingKey = 'UTF-8',
+                LanguageLocaleKey = 'en_US'
+            );
+            insert opsUser;
+            
+            // Assign PRU_CRMUser permission set to the test user
+            PermissionSet pruCRMUserPS = [
+                SELECT Id 
+                FROM PermissionSet 
+                WHERE Name = 'PRU_CRMUser' 
+                LIMIT 1
+            ];
+            
+            PermissionSetAssignment psa = new PermissionSetAssignment(
+                AssigneeId = opsUser.Id,
+                PermissionSetId = pruCRMUserPS.Id
+            );
+            insert psa;
+        }
+        
+        Case parentCase = createParentCase(opsUser.Id,'Test Parent Case','New');
+        createChildCase(parentCase.Id,'Test Child Case','In Progress',onbSingleContributionRecordTypeId);
+               
+         
+        
+    }
+    
+    /**
+     * @description Test scenario: New bond check record is created with 
+     *              PRU_CheckResult__c = 'PRU_ReviewRequired' (ISNEW condition).
+     *              Expected: Parent case status should update to 'Review Required'
+     *              when OPS user owns the parent case.
+     */
+    @isTest
+    static void testNewBondCheckWithReviewRequired_OriginOfFunds() {
+        // Retrieve test data
+      	createCustomSetting();
+        
+        Case childCase = [SELECT Id, ParentId FROM Case WHERE Subject = 'Test Child Case' LIMIT 1];
+        originOfFundsRecordTypeId = Schema.SObjectType.PRU_BondCheck__c.getRecordTypeInfosByDeveloperName()
+            .get('PRU_OriginOfFunds').getRecordTypeId();
+            
+        Test.startTest();
+        // Create new bond check with Origin of Funds record type
+        PRU_BondCheck__c newBondCheck = new PRU_BondCheck__c(
+            RecordTypeId = originOfFundsRecordTypeId,
+            PRU_Case__c = childCase.Id,
+            PRU_CheckResult__c = 'PRU_InProgress'
+        );
+        
+        insert newBondCheck;
+        
+        newBondCheck.PRU_CheckResult__c = 'PRU_ReviewRequired';
+        update newBondCheck;
+        
+        
+        Test.stopTest();
+        
+        // Verify parent case status was updated to 'Review Required'
+        Case updatedParentCase = [
+            SELECT Id, Status,OwnerId
+            FROM Case 
+            WHERE Id = :childCase.ParentId 
+            LIMIT 1
+        ];
+        
+        System.assertEquals(REVIEW_REQUIRED_STATUS, updatedParentCase.Status, 
+            'Parent case status should be updated to Review Required when new bond check is created with Review Required status');
+    }
+    
+    
+    /**
+     * @description Test scenario: Parent case owner is updated from queue to OPS user
+     *              for a child case with PRU_ONBSingleContribution record type.
+     *              Expected: Child case owner should be updated to match parent's new owner.
+     */
+    @isTest
+    static void testOwnerUpdateForSingleContribution() {
+        // Setup test data: parent case, child case with Single Contribution record type, queue, and OPS user
+        Map<String, Object> testData = setupOwnerUpdateTestData(
+            'Test Child Case - Owner Update', 
+            onbSingleContributionRecordTypeId
+        );
+        
+        // Execute flow and verify child case owner is updated
+        executeOwnerUpdateFlowAndVerify(
+            (Case)testData.get('parentCase'),
+            (User)testData.get('opsUser'),
+            'Test Child Case - Owner Update'
+        );
+    }
+    
+    /**
+     * @description Test scenario: Parent case owner is updated from queue to OPS user
+     *              for a child case with PRU_ONBAccountSetup record type.
+     *              Expected: Child case owner should be updated to match parent's new owner.
+     */
+    @isTest
+    static void testOwnerUpdateForAccountSetup() {
+        // Setup test data: parent case, child case with Account Setup record type, queue, and OPS user
+        Map<String, Object> testData = setupOwnerUpdateTestData(
+            'Test Child Case - Owner Update - Account Setup', 
+            onbAccountSetupRecordTypeId
+        );
+        
+        // Execute flow and verify child case owner is updated
+        executeOwnerUpdateFlowAndVerify(
+            (Case)testData.get('parentCase'),
+            (User)testData.get('opsUser'),
+            'Test Child Case - Owner Update - Account Setup'
+        );
+    }
+     
+}
